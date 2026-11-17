@@ -1,4 +1,4 @@
-"""FastAPI 应用：代理配置、连接统计、上传试传、网页。"""
+"""FastAPI 应用：代理配置、连接统计、抓取开关、轨迹下载、上传试传、网页。"""
 from __future__ import annotations
 
 import asyncio
@@ -15,6 +15,7 @@ from .engine import DelayProxy, ProxyConfig
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 UPLOAD_CHUNK = 256 * 1024
+TRACE_WAIT_SECONDS = 6.0  # 正常连接正在等轨迹落盘时，下载接口的等待上限
 
 
 def _env_config() -> ProxyConfig:
@@ -50,6 +51,10 @@ class ConfigIn(BaseModel):
     down_delay_ms: float = Field(ge=0, le=3_600_000)
 
 
+class CaptureIn(BaseModel):
+    enabled: bool
+
+
 @app.get("/", include_in_schema=False)
 async def index():
     return FileResponse(STATIC_DIR / "index.html")
@@ -58,7 +63,7 @@ async def index():
 @app.get("/api/config")
 async def get_config():
     snap = proxy.snapshot()
-    return {k: snap[k] for k in ("config", "listening", "listen_error")}
+    return {k: snap[k] for k in ("config", "listening", "listen_error", "capture")}
 
 
 @app.post("/api/config")
@@ -66,12 +71,72 @@ async def set_config(cfg: ConfigIn):
     await proxy.apply_config(ProxyConfig(**cfg.model_dump()))
     snap = proxy.snapshot()
     return {"ok": snap["listening"],
-            **{k: snap[k] for k in ("config", "listening", "listen_error")}}
+            **{k: snap[k] for k in ("config", "listening", "listen_error", "capture")}}
+
+
+@app.post("/api/capture")
+async def set_capture(cfg: CaptureIn):
+    """抓取开关。只影响之后建立的连接；已有连接沿用建立时的设置。"""
+    proxy.set_capture(cfg.enabled)
+    snap = proxy.snapshot()
+    return {"ok": True, "capture": snap["capture"]}
 
 
 @app.get("/api/connections")
 async def connections():
     return proxy.snapshot()
+
+
+@app.get("/api/connections/{conn_id}/trace")
+async def download_trace(conn_id: int):
+    """下载单条连接的轨迹文件（JSON Lines，UTF-8）。
+
+    正常连接必须等轨迹完整落盘后才提供下载；期间短暂等待。若轨迹不完整
+    （缓冲溢出、超限、写盘失败、断连/停机），仍返回已有内容，文件名带
+    ``.partial``，并附 ``X-Trace-Complete: false`` 与 ``X-Trace-Reason``。
+    """
+    deadline = time.monotonic() + TRACE_WAIT_SECONDS
+    while True:
+        info = proxy.find_info(conn_id)
+        if info is None or info.trace is None:
+            raise HTTPException(404, f"connection {conn_id} has no trace")
+        trace = info.trace
+        if trace._finalized:
+            break
+        if info.state == "active":
+            # 仍在转发的连接没有最终轨迹可下载
+            raise HTTPException(
+                409, f"trace for connection {conn_id} is still recording")
+        if time.monotonic() >= deadline:
+            raise HTTPException(
+                409, f"trace for connection {conn_id} is still being written")
+        await asyncio.sleep(0.1)
+
+    if trace._available_path is not None:
+        path = trace._available_path
+    else:
+        raise HTTPException(
+            410, f"trace file for connection {conn_id} is unavailable: "
+                 f"{trace.reason or trace._write_error or 'not written'}")
+
+    complete = trace.status == "complete"
+    filename = trace.filename if complete else trace.filename + ".partial"
+    headers = {
+        "X-Trace-Complete": "true" if complete else "false",
+        "X-Trace-Status": trace.status,
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-store",
+    }
+    if trace.reason:
+        # HTTP 头只允许 latin-1；中文原因做 RFC 5987 编码
+        headers["X-Trace-Reason"] = trace.reason.encode(
+            "ascii", "replace").decode("ascii")
+        try:
+            from urllib.parse import quote
+            headers["X-Trace-Reason-Utf8"] = quote(trace.reason, safe="")
+        except Exception:
+            pass
+    return FileResponse(path, media_type="application/x-ndjson", headers=headers)
 
 
 @app.post("/api/history/clear")

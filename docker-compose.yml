@@ -15,8 +15,14 @@ services:
       TARGET_PORT: "9000"
       UP_DELAY_MS: "300"         # 上行延迟：客户端 -> 目标
       DOWN_DELAY_MS: "300"       # 下行延迟：目标 -> 客户端
+      TRACE_DIR: /data/traces    # 抓取轨迹（JSONL）落盘目录
     ports:
       - "8000:8000"              # 网页 / API
       - "7000:7000"              # TCP 延迟代理（可直接对接设备/客户端）
+    volumes:
+      - proxy-traces:/data/traces
     depends_on:
       - receiver
+
+volumes:
+  proxy-traces:

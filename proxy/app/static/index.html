@@ -22,11 +22,27 @@ pre { background: #f7f7f7; padding: 10px; border-radius: 6px; white-space: pre-w
 .pill { padding: 1px 8px; border-radius: 10px; font-size: 11px; white-space: nowrap; }
 .st-active { background: #e7f5ff; } .st-closed { background: #ebfbee; } .st-error { background: #fff5f5; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
+.tr-complete { background: #ebfbee; } .tr-recording { background: #e7f5ff; }
+.tr-incomplete { background: #fff4e6; } .tr-off { background: #f1f3f5; }
+.trace a { color: #0b5cad; }
+.switch { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; }
+.switch label { width: auto; }
 </style>
 </head>
 <body>
 <h1>TCP 延迟代理 <span class="muted">慢链路下“上传结束却收不到回执”复现工具</span></h1>
 <div class="sub">延迟自代理读到字节起算，连续数据流水发送（不按块累加等待）；每向应用缓冲 ≤ 64 KiB，满则暂停该向读取；单向 EOF 先冲刷待发字节再转发半关闭，反向继续到结束。</div>
+
+<div class="card">
+  <h2>抓取开关</h2>
+  <div class="switch">
+    <input type="checkbox" id="captureToggle">
+    <label for="captureToggle">抓取转发轨迹（只对开启后新建的连接生效，已建立连接沿原设置）</label>
+    <span id="capStatus" class="muted"></span>
+  </div>
+  <div class="muted" style="margin-top:6px" id="capDetail"></div>
+  <div class="muted" style="margin-top:4px">每连接待写缓冲 ≤ 64 KiB、轨迹 ≤ 1 MiB；落盘变慢/超限/写盘失败时上传与回执照常，轨迹标记不完整并说明原因。正常连接等轨迹写完才显示为完整；断连或停机留下的轨迹不会被误标为完整。</div>
+</div>
 
 <div class="card">
   <h2>代理配置</h2>
@@ -54,11 +70,18 @@ pre { background: #f7f7f7; padding: 10px; border-radius: 6px; white-space: pre-w
   <div id="histWrap"></div>
 </div>
 
+<div class="card" id="tracePanel" style="display:none">
+  <h2><span id="traceTitle">轨迹</span> <button id="traceCloseBtn" style="float:right">关闭</button></h2>
+  <pre id="traceView"></pre>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fmtNum = n => (n ?? 0).toLocaleString();
 const fmtTime = ts => ts ? new Date(ts * 1000).toLocaleTimeString() : "-";
+const fmtDur = s => s == null ? "-" : (s < 1 ? `${Math.round(s * 1000)} ms` : `${s.toFixed(3)} s`);
+let captureEnabled = false;
 
 async function loadConfig() {
   const r = await fetch("/api/config");
@@ -69,6 +92,33 @@ async function loadConfig() {
   $("cfgStatus").innerHTML = d.listening
     ? `<span class="ok">● 监听中 ${esc(c.listen_host)}:${c.listen_port} → ${esc(c.target_host)}:${c.target_port}</span>`
     : `<span class="err">● 未监听：${esc(d.listen_error || "未启动")}</span>`;
+  applyCapture(d.capture);
+}
+
+function applyCapture(cap) {
+  if (!cap) return;
+  captureEnabled = !!cap.enabled;
+  $("captureToggle").checked = captureEnabled;
+  $("capStatus").innerHTML = captureEnabled
+    ? `<span class="ok">● 抓取已开启</span>` : `<span class="muted">● 抓取已关闭</span>`;
+  $("capDetail").textContent =
+    `轨迹目录：${cap.dir || "-"} ｜ 待写缓冲/连接 ≤ ${fmtNum(cap.pending_limit)} B ｜ 轨迹/连接 ≤ ${fmtNum(cap.max_bytes)} B`;
+}
+
+async function setCapture() {
+  const enabled = $("captureToggle").checked;
+  $("capStatus").textContent = "保存中…";
+  try {
+    const r = await fetch("/api/capture", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({enabled})});
+    const d = await r.json();
+    if (!r.ok) throw new Error(JSON.stringify(d));
+    applyCapture(d.capture);
+    refresh();
+  } catch (e) {
+    $("capStatus").innerHTML = `<span class="err">设置失败：${esc(e.message)}</span>`;
+  }
 }
 
 async function saveConfig() {
@@ -95,7 +145,34 @@ async function saveConfig() {
 
 const HEAD = `<tr><th>ID</th><th>状态</th><th>客户端</th><th>目标</th>` +
   `<th>上行字节</th><th>下行字节</th><th>上行缓冲<br>当前/峰值</th><th>下行缓冲<br>当前/峰值</th>` +
-  `<th>延迟ms<br>上/下</th><th>回执（下行尾部）</th><th>开始</th><th>结束</th><th>错误</th></tr>`;
+  `<th>延迟ms<br>上/下</th><th>抓取轨迹</th><th>回执（下行尾部）</th><th>开始</th><th>结束</th><th>错误</th></tr>`;
+
+function traceCell(c) {
+  if (!c.capture_requested) {
+    return `<td class="tr-off muted">未开启${c.trace_init_error ? `<br><span class="err">${esc(c.trace_init_error)}</span>` : ""}</td>`;
+  }
+  const t = c.capture || {};
+  if (t.enabled === false) {
+    return `<td class="tr-incomplete">抓取失败<br><span class="err">${esc(c.trace_init_error || "无轨迹会话")}</span></td>`;
+  }
+  const st = t.status || "?";
+  const pending = t.pending_bytes ? `，待写 ${fmtNum(t.pending_bytes)} B` : "";
+  if (st === "recording") {
+    return `<td class="tr-recording">记录中<br><span class="muted">已抓 ${fmtNum(t.captured_bytes)} B${pending}</span></td>`;
+  }
+  if (st === "finalizing") {
+    return `<td class="tr-recording">收尾中<br><span class="muted">等待轨迹写完 (${fmtNum(t.pending_bytes)} B)</span></td>`;
+  }
+  const label = st === "complete" ? "完整" : "不完整";
+  const cls = st === "complete" ? "tr-complete" : "tr-incomplete";
+  const reason = t.reason ? `<br><span class="err">${esc(t.reason)}</span>` : "";
+  const half = (t.half_close_order || []).length
+    ? `<br><span class="muted">半关闭顺序：${t.half_close_order.map(esc).join(" → ")}</span>` : "";
+  const btns = t.available
+    ? `<br><a href="${t.download_url}" download>下载</a> · <a href="#" onclick="showTrace(${c.id});return false">查看</a>`
+    : `<br><span class="err">轨迹文件不可用</span>`;
+  return `<td class="${cls}">${label}<br><span class="muted">已抓 ${fmtNum(t.captured_bytes)} B</span>${reason}${half}${btns}</td>`;
+}
 
 function connRow(c) {
   const receipt = (c.receipt || "").slice(-160);
@@ -105,6 +182,7 @@ function connRow(c) {
     `<td class="num">${fmtNum(c.up.queued)} / ${fmtNum(c.up.peak)}</td>` +
     `<td class="num">${fmtNum(c.down.queued)} / ${fmtNum(c.down.peak)}</td>` +
     `<td class="num">${c.up_delay_ms} / ${c.down_delay_ms}</td>` +
+    traceCell(c) +
     `<td>${esc(receipt)}</td><td>${fmtTime(c.started_at)}</td><td>${fmtTime(c.ended_at)}</td>` +
     `<td class="err">${esc(c.error || "")}</td></tr>`;
 }
@@ -113,12 +191,64 @@ async function refresh() {
   try {
     const r = await fetch("/api/connections");
     const d = await r.json();
+    applyCapture(d.capture);
     $("activeCount").textContent = `(${d.active.length})`;
     $("activeWrap").innerHTML = d.active.length
       ? `<table>${HEAD}${d.active.map(connRow).join("")}</table>` : `<div class="muted">无</div>`;
     $("histWrap").innerHTML = d.history.length
       ? `<table>${HEAD}${d.history.map(connRow).join("")}</table>` : `<div class="muted">无</div>`;
   } catch (e) { /* 下次刷新重试 */ }
+}
+
+// 在下方预览轨迹：逐行解析 JSONL，数据行按 UTF-8 解码展示（含不可打印字节提示）
+async function showTrace(id) {
+  $("traceTitle").textContent = `连接 ${id} 轨迹`;
+  $("traceView").textContent = "加载中…";
+  $("tracePanel").style.display = "block";
+  try {
+    const r = await fetch(`/api/connections/${id}/trace`);
+    if (!r.ok) throw new Error(`HTTP ${r.status} ${await r.text()}`);
+    const complete = r.headers.get("X-Trace-Complete");
+    const text = await r.text();
+    const lines = text.split("\n").filter(Boolean);
+    const out = [];
+    out.push(`HTTP ${r.status} ｜ 完整=${complete} ｜ 行数=${lines.length}` +
+      (r.headers.get("X-Trace-Reason") ? ` ｜ 原因=${r.headers.get("X-Trace-Reason")}` : ""));
+    let bytes = {up: 0, down: 0};
+    for (const ln of lines) {
+      if (ln === "[TRUNCATED]") { out.push("…（轨迹过长，预览已截断）"); break; }
+      let rec;
+      try { rec = JSON.parse(ln); } catch { out.push(ln); continue; }
+      if (rec.type === "data") {
+        bytes[rec.dir] = (bytes[rec.dir] || 0) + (rec.n || 0);
+        let raw;
+        try {
+          raw = decodeB64(rec.b64);
+        } catch { raw = "(base64 解码失败)"; }
+        const printable = raw.replace(/[^\x20-\x7e\n\r\t]/g, c =>
+          `\\x${c.charCodeAt(0).toString(16).padStart(2, "0")}`);
+        out.push(`+${fmtDur(rec.t)}  [${rec.dir}] ${rec.n} B  ${JSON.stringify(printable.length > 200 ? printable.slice(0, 200) + "…" : printable)}`);
+      } else if (rec.type === "end") {
+        out.push(`+${fmtDur(rec.t)}  [end] complete=${rec.complete} state=${rec.state}` +
+          (rec.reason ? ` reason=${rec.reason}` : "") +
+          (rec.half_close_order && rec.half_close_order.length ? ` half_close=${rec.half_close_order.join("→")}` : ""));
+      } else {
+        out.push(`+${fmtDur(rec.t)}  [${rec.type}${rec.event ? " " + rec.event : ""}] ` +
+          JSON.stringify(Object.fromEntries(Object.entries(rec).filter(([k]) =>
+            !["v","type","t","b64","n"].includes(k)))));
+      }
+    }
+    out.push(`-- 累计：up=${bytes.up} B, down=${bytes.down} B`);
+    $("traceView").textContent = out.join("\n");
+  } catch (e) {
+    $("traceView").textContent = `加载失败：${e.message}`;
+  }
+}
+
+function decodeB64(b64) {
+  const bin = atob(b64);
+  const arr = Uint8Array.from(bin, c => c.charCodeAt(0));
+  return new TextDecoder("utf-8").decode(arr);
 }
 
 async function doUpload() {
@@ -154,6 +284,8 @@ async function clearHistory() {
 $("saveBtn").onclick = saveConfig;
 $("upBtn").onclick = doUpload;
 $("clearBtn").onclick = clearHistory;
+$("captureToggle").onchange = setCapture;
+$("traceCloseBtn").onclick = () => { $("tracePanel").style.display = "none"; };
 loadConfig();
 refresh();
 setInterval(refresh, 1000);

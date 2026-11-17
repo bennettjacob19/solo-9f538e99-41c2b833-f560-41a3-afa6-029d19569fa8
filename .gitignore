@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
+# 本地运行产生的抓取轨迹（Compose 下写入命名卷，不会落到仓库）
+traces/
+conn-*.jsonl
+conn-*.jsonl.partial
